@@ -564,9 +564,161 @@ func (bits floatEncoder) encode(e *encodeState, v reflect.Value, opts encOpts) {
 	e.Write(b)
 }
 
+const DBL_DIG = 0
+const MAX_DECPT_FOR_F_FORMAT = DBL_DIG
+
+func (bits floatEncoder) myGcvt(e *encodeState, v reflect.Value, opts encOpts) {
+	var decpt int
+	var leng int
+	var exp_len int
+	var have_space bool
+	var force_e_format bool
+
+	//var sign int
+	//var err bool
+
+	var format byte
+
+	width := 9
+	f := v.Float()
+	if f < 0.0 {
+		width--
+	}
+
+	// Convert as if by ES6 number to string conversion.
+	// This matches most other JSON generators.
+	// See golang.org/issue/6384 and golang.org/issue/14135.
+	// Like format %g, but the exponent cutoffs are different
+	// and exponents themselves are not padded to two digits.
+	b := e.AvailableBuffer()
+	b = mayAppendQuote(b, opts.quoted)
+
+	// get decpt
+	b1 := e.AvailableBuffer()
+	b1 = strconv.AppendFloat(b1, f, format, -1, int(bits))
+
+	ex := string(b1)
+	index := strings.Index(ex, "e")
+	if index < 0 {
+		decpt = 0
+	} else {
+		decpt, _ = strconv.Atoi(ex[index+1:])
+	}
+
+	/*
+	   Number of digits in the exponent from the 'e' conversion.
+	    The sign of the exponent is taken into account separetely, we don't need
+	    to count it here.
+	*/
+	//exp_len = 1 + (decpt >= 101 || decpt <= -99) + (decpt >= 11 || decpt <= -9);
+	exp_len += 1
+	if decpt >= 101 || decpt <= -99 {
+		exp_len += 1
+	}
+
+	if decpt >= 11 || decpt <= -9 {
+		exp_len += 1
+	}
+
+	/*
+			Do we have enough space for all digits in the 'f' format?
+		Let 'len' be the number of significant digits returned by dtoa,
+			and F be the length of the resulting decimal representation.
+			Consider the following cases:
+		1. decpt <= 0, i.e. we have "0.NNN" => F = len - decpt + 2
+		2. 0 < decpt < len, i.e. we have "NNN.NNN" => F = len + 1
+		3. len <= decpt, i.e. we have "NNN00" => F = decpt
+	*/
+	//have_space =
+	//      (decpt <= 0 ? len - decpt + 2
+	//                  : decpt > 0 && decpt < len ? len + 1 : decpt) <= width;
+	var widthTmp int
+	if decpt <= 0 {
+		widthTmp = leng - decpt + 2
+	} else if decpt > 0 && decpt < leng {
+		widthTmp = leng + 1
+	} else {
+		widthTmp = decpt
+	}
+	have_space = widthTmp <= width
+
+	/*
+	   The following is true when no significant digits can be placed with the
+	   specified field width using the 'f' format, and the 'e' format
+	   will not be truncated.
+	*/
+	//force_e_format = (decpt <= 0 && width <= 2 - decpt && width >= 3 + exp_len);
+	force_e_format = decpt <= 0 && width <= 2-decpt && width >= 3+exp_len
+
+	/*
+	   Assume that we don't have enough space to place all significant digits in
+	   the 'f' format. We have to choose between the 'e' format and the 'f' one
+	   to keep as many significant digits as possible.
+	   Let E and F be the lengths of decimal representaion in the 'e' and 'f'
+	   formats, respectively. We want to use the 'f' format if, and only if F <= E.
+	   Consider the following cases:
+	   1. decpt <= 0.
+	      F = len - decpt + 2 (see above)
+	      E = len + (len > 1) + 1 + 1 (decpt <= -99) + (decpt <= -9) + 1
+	      ("N.NNe-MMM")
+	      (F <= E) <=> (len == 1 && decpt >= -1) || (len > 1 && decpt >= -2)
+	      We also need to ensure that if the 'f' format is chosen,
+	      the field width allows us to place at least one significant digit
+	      (i.e. width > 2 - decpt). If not, we prefer the 'e' format.
+	   2. 0 < decpt < len
+	      F = len + 1 (see above)
+	      E = len + 1 + 1 + ... ("N.NNeMMM")
+	      F is always less than E.
+	   3. len <= decpt <= width
+	      In this case we have enough space to represent the number in the 'f'
+	      format, so we prefer it with some exceptions.
+	   4. width < decpt
+	      The number cannot be represented in the 'f' format at all, always use
+	      the 'e' 'one.
+	*/
+	//if ((have_space ||
+	/*
+	   Not enough space, let's see if the 'f' format provides the most number
+	   of significant digits.
+	*/
+	/*((decpt <= width &&
+	(decpt >= -1 || (decpt == -2 && (len > 1 || !force_e_format)))) &&
+	!force_e_format)) &&*/
+
+	/*
+	   Use the 'e' format in some cases even if we have enough space for the
+	   'f' one. See comment for MAX_DECPT_FOR_F_FORMAT.
+	*/
+	/*(!have_space || (decpt >= -MAX_DECPT_FOR_F_FORMAT + 1 &&
+	(decpt <= MAX_DECPT_FOR_F_FORMAT || len > decpt)))) {*/
+	if (have_space || ((decpt <= width &&
+		(decpt >= -1 || (decpt == -2 && (leng > 1 || !force_e_format)))) &&
+		!force_e_format)) && (!have_space || (decpt >= -MAX_DECPT_FOR_F_FORMAT+1 &&
+		(decpt <= MAX_DECPT_FOR_F_FORMAT || leng > decpt))) {
+		/* 'f' format */
+		format = 'f'
+	} else {
+		/* 'e' format */
+		format = 'e'
+	}
+
+	b = strconv.AppendFloat(b, f, format, decpt, int(bits))
+	if format == 'e' {
+		// clean up e-09 to e-9
+		n := len(b)
+		if n >= 4 && b[n-4] == 'e' && b[n-3] == '-' && b[n-2] == '0' {
+			b[n-2] = b[n-1]
+			b = b[:n-1]
+		}
+	}
+
+	b = mayAppendQuote(b, opts.quoted)
+	e.Write(b)
+}
+
 var (
 	float32Encoder = (floatEncoder(32)).encode
-	float64Encoder = (floatEncoder(64)).encode
+	float64Encoder = (floatEncoder(64)).myGcvt
 )
 
 func stringEncoder(e *encodeState, v reflect.Value, opts encOpts) {
